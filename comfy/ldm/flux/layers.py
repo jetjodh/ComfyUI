@@ -115,6 +115,18 @@ class Modulation(nn.Module):
         )
 
 
+class StyleModulation(nn.Module):
+    def __init__(self, dim: int, style_dim: int, dtype=None, device=None, operations=None):
+        super().__init__()
+        self.style_proj = operations.Linear(style_dim, dim * 2, bias=True, dtype=dtype, device=device)
+        self.norm = operations.LayerNorm(dim, elementwise_affine=False, eps=1e-6, dtype=dtype, device=device)
+
+    def forward(self, x: Tensor, style: Tensor) -> Tensor:
+        style_params = self.style_proj(style).unsqueeze(1)
+        scale, shift = style_params.chunk(2, dim=-1)
+        return self.norm(x) * (1 + scale) + shift
+
+
 class DoubleStreamBlock(nn.Module):
     def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float, qkv_bias: bool = False, dtype=None, device=None, operations=None):
         super().__init__()
@@ -144,13 +156,17 @@ class DoubleStreamBlock(nn.Module):
             operations.Linear(mlp_hidden_dim, hidden_size, bias=True, dtype=dtype, device=device),
         )
 
-    def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor):
+        self.img_style_mod = StyleModulation(hidden_size, hidden_size, dtype=dtype, device=device, operations=operations)
+        self.txt_style_mod = StyleModulation(hidden_size, hidden_size, dtype=dtype, device=device, operations=operations)
+
+    def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, style: Tensor):
         img_mod1, img_mod2 = self.img_mod(vec)
         txt_mod1, txt_mod2 = self.txt_mod(vec)
 
         # prepare image for attention
         img_modulated = self.img_norm1(img)
         img_modulated = (1 + img_mod1.scale) * img_modulated + img_mod1.shift
+        img_modulated = self.img_style_mod(img_modulated, style)
         img_qkv = self.img_attn.qkv(img_modulated)
         img_q, img_k, img_v = img_qkv.view(img_qkv.shape[0], img_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
         img_q, img_k = self.img_attn.norm(img_q, img_k, img_v)
@@ -158,6 +174,7 @@ class DoubleStreamBlock(nn.Module):
         # prepare txt for attention
         txt_modulated = self.txt_norm1(txt)
         txt_modulated = (1 + txt_mod1.scale) * txt_modulated + txt_mod1.shift
+        txt_modulated = self.txt_style_mod(txt_modulated, style)
         txt_qkv = self.txt_attn.qkv(txt_modulated)
         txt_q, txt_k, txt_v = txt_qkv.view(txt_qkv.shape[0], txt_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
         txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
@@ -218,10 +235,11 @@ class SingleStreamBlock(nn.Module):
 
         self.mlp_act = nn.GELU(approximate="tanh")
         self.modulation = Modulation(hidden_size, double=False, dtype=dtype, device=device, operations=operations)
+        self.style_mod = StyleModulation(hidden_size, hidden_size, dtype=dtype, device=device, operations=operations)
 
-    def forward(self, x: Tensor, vec: Tensor, pe: Tensor) -> Tensor:
+    def forward(self, x: Tensor, vec: Tensor, pe: Tensor, style: Tensor) -> Tensor:
         mod, _ = self.modulation(vec)
-        x_mod = (1 + mod.scale) * self.pre_norm(x) + mod.shift
+        x_mod = self.style_mod((1 + mod.scale) * self.pre_norm(x) + mod.shift, style)
         qkv, mlp = torch.split(self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
 
         q, k, v = qkv.view(qkv.shape[0], qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
