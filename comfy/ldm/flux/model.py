@@ -63,6 +63,8 @@ class Flux(nn.Module):
         )
         self.txt_in = operations.Linear(params.context_in_dim, self.hidden_size, dtype=dtype, device=device)
 
+        self.style_encoder = MLPEmbedder(params.vec_in_dim, self.hidden_size, dtype=dtype, device=device, operations=operations)
+
         self.double_blocks = nn.ModuleList(
             [
                 DoubleStreamBlock(
@@ -96,6 +98,7 @@ class Flux(nn.Module):
         y: Tensor,
         guidance: Tensor = None,
         control=None,
+        style_image: Tensor = None,
     ) -> Tensor:
         if img.ndim != 3 or txt.ndim != 3:
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
@@ -111,11 +114,13 @@ class Flux(nn.Module):
         vec = vec + self.vector_in(y)
         txt = self.txt_in(txt)
 
+        style = self.style_encoder(style_image) if style_image is not None else torch.zeros_like(vec)
+
         ids = torch.cat((txt_ids, img_ids), dim=1)
         pe = self.pe_embedder(ids)
 
         for i, block in enumerate(self.double_blocks):
-            img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
+            img, txt = block(img=img, txt=txt, vec=vec, pe=pe, style=style)
 
             if control is not None: # Controlnet
                 control_i = control.get("input")
@@ -127,7 +132,7 @@ class Flux(nn.Module):
         img = torch.cat((txt, img), 1)
 
         for i, block in enumerate(self.single_blocks):
-            img = block(img, vec=vec, pe=pe)
+            img = block(img, vec=vec, pe=pe, style=style)
 
             if control is not None: # Controlnet
                 control_o = control.get("output")
@@ -141,7 +146,7 @@ class Flux(nn.Module):
         img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
         return img
 
-    def forward(self, x, timestep, context, y, guidance, control=None, **kwargs):
+    def forward(self, x, timestep, context, y, guidance, control=None, style_image=None, **kwargs):
         bs, c, h, w = x.shape
         patch_size = 2
         x = comfy.ldm.common_dit.pad_to_patch_size(x, (patch_size, patch_size))
@@ -156,5 +161,5 @@ class Flux(nn.Module):
         img_ids = repeat(img_ids, "h w c -> b (h w) c", b=bs)
 
         txt_ids = torch.zeros((bs, context.shape[1], 3), device=x.device, dtype=x.dtype)
-        out = self.forward_orig(img, img_ids, context, txt_ids, timestep, y, guidance, control)
+        out = self.forward_orig(img, img_ids, context, txt_ids, timestep, y, guidance, control, style_image)
         return rearrange(out, "b (h w) (c ph pw) -> b c (h ph) (w pw)", h=h_len, w=w_len, ph=2, pw=2)[:,:,:h,:w]
